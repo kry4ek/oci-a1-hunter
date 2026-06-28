@@ -1,65 +1,62 @@
 name: hunt-a1
 on:
-  schedule:
-    - cron: '*/15 * * * *'
+  schedule: [ { cron: '*/15 * * * *' } ]
   workflow_dispatch: {}
-permissions:
-  contents: read
-  issues: write
+permissions: { contents: read, issues: write }
 concurrency: { group: hunt-a1, cancel-in-progress: false }
 jobs:
   launch:
     runs-on: ubuntu-latest
-    env:
-      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
-      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
-      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
-      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
-      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
-      OCI_CLI_AUTH: api_key
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
-      - name: Attempt A1 launch (2 OCPU / 12 GB)
+      - name: Hunt A1 (2 OCPU / 12 GB)
         id: launch
         shell: bash --noprofile --norc {0}
         env:
+          U: ${{ secrets.OCI_CLI_USER }}
+          T: ${{ secrets.OCI_CLI_TENANCY }}
+          F: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          K: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          R: ${{ secrets.OCI_CLI_REGION }}
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -uo pipefail
-          C="$OCI_CLI_TENANCY"
-          if ! oci iam region list >/dev/null 2>/tmp/auth; then
-            echo "❌ OCI auth failed — check the OCI_CLI_* secrets."
-            echo "----- oci error -----"; cat /tmp/auth; exit 1
-          fi
-          echo "auth OK"
-          EXISTING=$(oci compute instance list -c "$C" --all | jq -r '[.data[]? | select(."display-name"=="tott-web" and (."lifecycle-state"|IN("RUNNING","PROVISIONING","STARTING")))] | length')
+          echo "=== secret check (safe to share) ==="
+          echo "USER  starts '${U:0:11}'  len ${#U}   (want starts 'ocid1.user.')"
+          echo "TENANCY starts '${T:0:13}'  len ${#T}   (want starts 'ocid1.tenancy')"
+          echo "FINGERPRINT len ${#F}    REGION '${R}'"
+          echo "KEY first line '$(printf '%s' "$K" | head -1)'  len ${#K}"
+          echo "===================================="
+          mkdir -p ~/.oci
+          printf '%s\n' "$K" > ~/.oci/key.pem; chmod 600 ~/.oci/key.pem
+          { echo "[DEFAULT]"; echo "user=$U"; echo "tenancy=$T"; echo "fingerprint=$F"; echo "region=$R"; echo "key_file=$HOME/.oci/key.pem"; } > ~/.oci/config
+          chmod 600 ~/.oci/config
+          if ! oci iam region list >/tmp/auth 2>&1; then echo "❌ auth still failing:"; cat /tmp/auth; exit 1; fi
+          echo "✅ auth OK"
+          C="$T"
+          EXISTING=$(oci compute instance list -c "$C" --all | jq -r '[.data[]?|select(."display-name"=="tott-web" and (."lifecycle-state"|IN("RUNNING","PROVISIONING","STARTING")))]|length')
           if [ "${EXISTING:-0}" != "0" ]; then echo "tott-web already exists."; exit 0; fi
           VCN=$(oci network vcn list -c "$C" --all | jq -r '.data[]?|select(."display-name"=="tott-vcn")|.id' | head -1)
           SUBNET=$(oci network subnet list -c "$C" --vcn-id "$VCN" --all | jq -r '.data[]?|select(."prohibit-public-ip-on-vnic"==false)|.id' | head -1)
           IMAGE=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --operating-system-version 22.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC | jq -r '.data[0].id')
           echo "VCN=$VCN"; echo "SUBNET=$SUBNET"
-          if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "config error: SUBNET/IMAGE empty (check VCN is named 'tott-vcn' and region is eu-frankfurt-1)"; exit 1; fi
+          if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "config error: SUBNET/IMAGE empty (VCN must be named 'tott-vcn')"; exit 1; fi
           META=$(jq -n --arg k "$SSH_PUBLIC_KEY" '{ssh_authorized_keys:$k}')
           mapfile -t ADS < <(oci iam availability-domain list | jq -r '.data[].name')
           for AD in $(printf '%s\n' "${ADS[@]}" | shuf); do
             echo "trying $AD ..."
-            if oci compute instance launch \
-                --availability-domain "$AD" --compartment-id "$C" \
+            if oci compute instance launch --availability-domain "$AD" --compartment-id "$C" \
                 --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
                 --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
                 --display-name tott-web --metadata "$META" 2>/tmp/err; then
-              echo "✅ LAUNCHED in $AD"
-              echo "launched=true" >> "$GITHUB_OUTPUT"; echo "ad=$AD" >> "$GITHUB_OUTPUT"; exit 0
+              echo "✅ LAUNCHED in $AD"; echo "launched=true" >> "$GITHUB_OUTPUT"; echo "ad=$AD" >> "$GITHUB_OUTPUT"; exit 0
             fi
-            if grep -qiE "capacity" /tmp/err; then echo "  out of capacity in $AD";
-            else echo "  non-capacity error:"; cat /tmp/err; exit 1; fi
+            if grep -qiE capacity /tmp/err; then echo "  out of capacity in $AD"; else echo "  error:"; cat /tmp/err; exit 1; fi
             sleep 10
           done
-          echo "no capacity this run — will retry next schedule"
-      - name: Open an issue when it lands
+          echo "no capacity this run"
+      - name: Issue on success
         if: steps.launch.outputs.launched == 'true'
         env: { GH_TOKEN: "${{ github.token }}" }
-        run: |
-          gh issue create --title "✅ tott-web A1 launched (${{ steps.launch.outputs.ad }})" \
-            --body "Grab the public IP in OCI Compute > Instances, then disable this workflow." || true
+        run: gh issue create --title "✅ tott-web A1 launched (${{ steps.launch.outputs.ad }})" --body "Grab the public IP in OCI Compute > Instances, then disable this workflow." || true
