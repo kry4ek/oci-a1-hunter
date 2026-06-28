@@ -47,8 +47,11 @@ jobs:
                   --display-name tott-web --metadata "$META" 2>/tmp/err; then
                 echo "✅ LAUNCHED in $AD"; echo "launched=true" >> "$GITHUB_OUTPUT"; echo "ad=$AD" >> "$GITHUB_OUTPUT"; exit 0
               fi
-              if grep -qiE capacity /tmp/err; then echo "$(date +%T) out of capacity in $AD";
-              else echo "non-capacity error:"; cat /tmp/err; exit 1; fi
+              if grep -qiE 'capacity' /tmp/err; then
+                echo "$(date +%T) out of capacity in $AD"
+              else
+                echo "$(date +%T) transient/other error in $AD (will keep trying): $(grep -oiE '"message": *"[^"]*"' /tmp/err | head -1)"
+              fi
               sleep 15
             done
           done
