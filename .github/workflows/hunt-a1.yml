@@ -1,16 +1,17 @@
 name: hunt-a1
 on:
-  schedule: [ { cron: '*/15 * * * *' } ]
+  schedule: [ { cron: '5 * * * *' } ]   # hourly (minute 5 avoids the :00 congestion)
   workflow_dispatch: {}
 permissions: { contents: read, issues: write }
 concurrency: { group: hunt-a1, cancel-in-progress: false }
 jobs:
   launch:
     runs-on: ubuntu-latest
+    timeout-minutes: 58
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
-      - name: Hunt A1 (2 OCPU / 12 GB)
+      - name: Hunt A1 (2 OCPU / 12 GB) — ~55 min/run
         id: launch
         shell: bash --noprofile --norc {0}
         env:
@@ -22,40 +23,34 @@ jobs:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -uo pipefail
-          echo "=== secret check (safe to share) ==="
-          echo "USER  starts '${U:0:11}'  len ${#U}   (want starts 'ocid1.user.')"
-          echo "TENANCY starts '${T:0:13}'  len ${#T}   (want starts 'ocid1.tenancy')"
-          echo "FINGERPRINT len ${#F}    REGION '${R}'"
-          echo "KEY first line '$(printf '%s' "$K" | head -1)'  len ${#K}"
-          echo "===================================="
           mkdir -p ~/.oci
           printf '%s\n' "$K" > ~/.oci/key.pem; chmod 600 ~/.oci/key.pem
           { echo "[DEFAULT]"; echo "user=$U"; echo "tenancy=$T"; echo "fingerprint=$F"; echo "region=$R"; echo "key_file=$HOME/.oci/key.pem"; } > ~/.oci/config
           chmod 600 ~/.oci/config
-          if ! oci iam region list >/tmp/auth 2>&1; then echo "❌ auth still failing:"; cat /tmp/auth; exit 1; fi
-          echo "✅ auth OK"
+          oci iam region list >/dev/null 2>&1 || { echo "❌ auth failed"; exit 1; }
           C="$T"
-          EXISTING=$(oci compute instance list -c "$C" --all | jq -r '[.data[]?|select(."display-name"=="tott-web" and (."lifecycle-state"|IN("RUNNING","PROVISIONING","STARTING")))]|length')
-          if [ "${EXISTING:-0}" != "0" ]; then echo "tott-web already exists."; exit 0; fi
+          if [ "$(oci compute instance list -c "$C" --all | jq -r '[.data[]?|select(."display-name"=="tott-web" and (."lifecycle-state"|IN("RUNNING","PROVISIONING","STARTING")))]|length')" != "0" ]; then echo "tott-web already exists."; exit 0; fi
           VCN=$(oci network vcn list -c "$C" --all | jq -r '.data[]?|select(."display-name"=="tott-vcn")|.id' | head -1)
           SUBNET=$(oci network subnet list -c "$C" --vcn-id "$VCN" --all | jq -r '.data[]?|select(."prohibit-public-ip-on-vnic"==false)|.id' | head -1)
           IMAGE=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --operating-system-version 22.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC | jq -r '.data[0].id')
-          echo "VCN=$VCN"; echo "SUBNET=$SUBNET"
-          if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "config error: SUBNET/IMAGE empty (VCN must be named 'tott-vcn')"; exit 1; fi
+          if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "config error: SUBNET/IMAGE empty"; exit 1; fi
           META=$(jq -n --arg k "$SSH_PUBLIC_KEY" '{ssh_authorized_keys:$k}')
           mapfile -t ADS < <(oci iam availability-domain list | jq -r '.data[].name')
-          for AD in $(printf '%s\n' "${ADS[@]}" | shuf); do
-            echo "trying $AD ..."
-            if oci compute instance launch --availability-domain "$AD" --compartment-id "$C" \
-                --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
-                --display-name tott-web --metadata "$META" 2>/tmp/err; then
-              echo "✅ LAUNCHED in $AD"; echo "launched=true" >> "$GITHUB_OUTPUT"; echo "ad=$AD" >> "$GITHUB_OUTPUT"; exit 0
-            fi
-            if grep -qiE capacity /tmp/err; then echo "  out of capacity in $AD"; else echo "  error:"; cat /tmp/err; exit 1; fi
-            sleep 10
+          END=$(( $(date +%s) + 3300 ))   # keep hunting for ~55 minutes
+          while [ "$(date +%s)" -lt "$END" ]; do
+            for AD in $(printf '%s\n' "${ADS[@]}" | shuf); do
+              if oci compute instance launch --availability-domain "$AD" --compartment-id "$C" \
+                  --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+                  --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                  --display-name tott-web --metadata "$META" 2>/tmp/err; then
+                echo "✅ LAUNCHED in $AD"; echo "launched=true" >> "$GITHUB_OUTPUT"; echo "ad=$AD" >> "$GITHUB_OUTPUT"; exit 0
+              fi
+              if grep -qiE capacity /tmp/err; then echo "$(date +%T) out of capacity in $AD";
+              else echo "non-capacity error:"; cat /tmp/err; exit 1; fi
+              sleep 15
+            done
           done
-          echo "no capacity this run"
+          echo "no capacity this run; next run starts next hour"
       - name: Issue on success
         if: steps.launch.outputs.launched == 'true'
         env: { GH_TOKEN: "${{ github.token }}" }
