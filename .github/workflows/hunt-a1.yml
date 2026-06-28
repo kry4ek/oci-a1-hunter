@@ -1,0 +1,60 @@
+name: hunt-a1
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every ~15 min
+  workflow_dispatch: {}       # manual "Run workflow" button
+permissions:
+  contents: read
+  issues: write
+concurrency: { group: hunt-a1, cancel-in-progress: false }
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      OCI_CLI_AUTH: api_key
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+      - name: Attempt A1 launch (2 OCPU / 12 GB)
+        id: launch
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -uo pipefail
+          C="$OCI_CLI_TENANCY"
+          EXISTING=$(oci compute instance list -c "$C" --all 2>/dev/null | jq -r '[.data[]? | select(."display-name"=="tott-web" and (."lifecycle-state"|IN("RUNNING","PROVISIONING","STARTING")))] | length')
+          if [ "${EXISTING:-0}" != "0" ]; then echo "tott-web already exists — nothing to do."; exit 0; fi
+          VCN=$(oci network vcn list -c "$C" --all | jq -r '.data[]?|select(."display-name"=="tott-vcn")|.id' | head -1)
+          SUBNET=$(oci network subnet list -c "$C" --vcn-id "$VCN" --all | jq -r '.data[]?|select(."prohibit-public-ip-on-vnic"==false)|.id' | head -1)
+          IMAGE=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --operating-system-version 22.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC | jq -r '.data[0].id')
+          if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "config error: SUBNET or IMAGE empty"; exit 1; fi
+          META=$(jq -n --arg k "$SSH_PUBLIC_KEY" '{ssh_authorized_keys:$k}')
+          mapfile -t ADS < <(oci iam availability-domain list | jq -r '.data[].name')
+          for AD in $(printf '%s\n' "${ADS[@]}" | shuf); do
+            echo "trying $AD ..."
+            if oci compute instance launch \
+                --availability-domain "$AD" --compartment-id "$C" \
+                --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                --display-name tott-web --metadata "$META" 2>/tmp/err; then
+              echo "✅ LAUNCHED in $AD"
+              echo "launched=true" >> "$GITHUB_OUTPUT"
+              echo "ad=$AD" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if grep -qiE "capacity" /tmp/err; then echo "  out of capacity in $AD";
+            else echo "  non-capacity error:"; cat /tmp/err; exit 1; fi
+            sleep 10
+          done
+          echo "no capacity this run — will retry next schedule"
+      - name: Open an issue when it lands
+        if: steps.launch.outputs.launched == 'true'
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh issue create --title "✅ tott-web A1 launched (${{ steps.launch.outputs.ad }})" \
+            --body "Grab the public IP in OCI Compute > Instances, then disable this workflow (Actions tab > hunt-a1 > ... > Disable workflow)." || true
