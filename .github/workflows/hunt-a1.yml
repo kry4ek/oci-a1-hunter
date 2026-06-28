@@ -1,6 +1,6 @@
 name: hunt-a1
 on:
-  schedule: [ { cron: '5 * * * *' } ]   # hourly (minute 5 avoids the :00 congestion)
+  schedule: [ { cron: '5 * * * *' } ]
   workflow_dispatch: {}
 permissions: { contents: read, issues: write }
 concurrency: { group: hunt-a1, cancel-in-progress: false }
@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
-      - name: Hunt A1 (2 OCPU / 12 GB) — ~55 min/run
+      - name: Hunt A1 (2 OCPU / 12 GB)
         id: launch
         shell: bash --noprofile --norc {0}
         env:
@@ -29,14 +29,16 @@ jobs:
           chmod 600 ~/.oci/config
           oci iam region list >/dev/null 2>&1 || { echo "❌ auth failed"; exit 1; }
           C="$T"
-          if [ "$(oci compute instance list -c "$C" --all | jq -r '[.data[]?|select(."display-name"=="tott-web" and (."lifecycle-state"|IN("RUNNING","PROVISIONING","STARTING")))]|length')" != "0" ]; then echo "tott-web already exists."; exit 0; fi
+          COUNT=$(oci compute instance list -c "$C" --all 2>/dev/null | jq -r '[.data[]?|select(."display-name"=="tott-web" and ."lifecycle-state"=="RUNNING")]|length' 2>/dev/null || echo 0)
+          case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
+          if [ "$COUNT" -gt 0 ]; then echo "tott-web already RUNNING — done."; exit 0; fi
           VCN=$(oci network vcn list -c "$C" --all | jq -r '.data[]?|select(."display-name"=="tott-vcn")|.id' | head -1)
           SUBNET=$(oci network subnet list -c "$C" --vcn-id "$VCN" --all | jq -r '.data[]?|select(."prohibit-public-ip-on-vnic"==false)|.id' | head -1)
           IMAGE=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --operating-system-version 22.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC | jq -r '.data[0].id')
           if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "config error: SUBNET/IMAGE empty"; exit 1; fi
           META=$(jq -n --arg k "$SSH_PUBLIC_KEY" '{ssh_authorized_keys:$k}')
           mapfile -t ADS < <(oci iam availability-domain list | jq -r '.data[].name')
-          END=$(( $(date +%s) + 3300 ))   # keep hunting for ~55 minutes
+          END=$(( $(date +%s) + 3300 ))
           while [ "$(date +%s)" -lt "$END" ]; do
             for AD in $(printf '%s\n' "${ADS[@]}" | shuf); do
               if oci compute instance launch --availability-domain "$AD" --compartment-id "$C" \
