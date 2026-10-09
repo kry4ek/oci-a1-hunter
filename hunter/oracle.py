@@ -126,37 +126,7 @@ class OracleGateway:
         ]
         self.ads = [
             ad.name
-            for ad in self._list(self.identity.list_availability_domains, self.tenancy)
-        ]
-        if not self.ads:
-            raise AttentionRequired("OCI returned no availability domains.")
-
-    def _instances(self):
-        return [
-            instance
-            for compartment in self.compartments
-            for instance in self._list(self.compute.list_instances, compartment)
-            if instance.lifecycle_state != "TERMINATED"
-        ]
-
-    @staticmethod
-    def _instance(instance):
-        return Instance(
-            instance.id, instance.lifecycle_state, instance.availability_domain
-        )
-
-    def find_existing(self, inventory=None):
-        inventory = self._instances() if inventory is None else inventory
-        matches = [
-            i
-            for i in inventory
-            if i.display_name == INSTANCE_NAME
-            or (i.freeform_tags or {}).get("oci-a1-hunter")
-            == OWNER_TAG["oci-a1-hunter"]
-        ]
-        if len(matches) > 1:
-            raise AttentionRequired(
-                "Multiple matching instances exist; inspect OCI before continuing."
+            for ad in self._list(self.identity.list_            "Multiple matching instances exist; inspect OCI before continuing."
             )
         return self._instance(matches[0]) if matches else None
 
@@ -326,6 +296,9 @@ class OracleGateway:
             "shape": SHAPE,
             "boot_gb": BOOT_GB,
             "vpus_per_gb": 10,
+            "region": REGION,
+            "assign_public_ip": True,
+            "freeform_tags": OWNER_TAG,
             "ssh_sha256": hashlib.sha256(self.ssh_key.encode()).hexdigest(),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

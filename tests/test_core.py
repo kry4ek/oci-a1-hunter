@@ -264,6 +264,25 @@ class HunterTests(unittest.TestCase):
         ).run()
         self.assertEqual(self.gateway.launches[0], self.gateway.launches[1])
 
+    def test_fatal_rejection_of_uncertain_replay_preserves_original_checkpoint(self):
+        self.setup_hunter(
+            answers=[TimeoutError(), ServiceError(409, "InvalidatedRetryToken")]
+        )
+        with self.assertRaises(AttentionRequired):
+            self.runner.run()
+        self.assertEqual(self.store.state["phase"], "pending")
+        self.assertEqual(self.gateway.launches[0], self.gateway.launches[1])
+
+    def test_throttled_uncertain_replay_keeps_same_token(self):
+        self.setup_hunter(
+            answers=[
+                TimeoutError(),
+                ServiceError(429, "TooManyRequests"),
+                Instance("vm", "RUNNING"),
+            ]
+        ).run()
+        self.assertEqual(self.gateway.launches[0], self.gateway.launches[2])
+
     def test_expired_pending_request_never_launches(self):
         self.setup_hunter(state={"phase": "pending"})
         self.gateway.validate_pending.side_effect = AttentionRequired("expired")

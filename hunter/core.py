@@ -148,6 +148,7 @@ class Hunter:
             self.result.instance = plan.existing
             return self._track(state)
         pending = state if state.get("phase") == "pending" else None
+        pending_uncertain = pending is not None
         if pending:
             self.gateway.validate_pending(pending)
         candidates = []
@@ -185,6 +186,7 @@ class Hunter:
                 )
                 # This durable write must be acknowledged BEFORE any OCI creation call.
                 self.store.save(pending)
+                pending_uncertain = False
             else:
                 existing = self.gateway.find_existing()
                 if existing:
@@ -206,17 +208,22 @@ class Hunter:
                 kind = classify_error(exc)
                 self.result.counts[kind] += 1
                 self.log(f"{kind}: {error_description(exc)}")
-                if kind in {"capacity", "throttled", "fatal"}:
+                if kind == "capacity" or (
+                    kind in {"throttled", "fatal"} and not pending_uncertain
+                ):
                     # These are explicit rejections, so advancing to a new token is safe.
                     self.store.save({"phase": "idle"})
                     pending = None
                     uncertainties = 0
                 if kind == "fatal":
+                    # A rejection of a replay does not resolve an earlier lost response.
+                    # Preserve that checkpoint instead of allowing a new token next run.
                     raise AttentionRequired(error_description(exc)) from exc
                 if kind == "throttled":
                     throttles += 1
                     delay = self.rng.uniform(60, min(300, 60 * 2**throttles))
                 elif kind == "uncertain":
+                    pending_uncertain = True
                     uncertainties += 1
                     # Keep the exact request/token, including across subsequent workflow runs.
                     delay = self.rng.uniform(30, min(120, 30 * 2**uncertainties))

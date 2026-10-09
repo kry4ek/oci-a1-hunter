@@ -84,8 +84,10 @@ an idempotency token, timestamp, and (after acceptance) the instance ID. In this
 public repository these resource identifiers are public metadata. It never
 stores the API private key, GitHub token, or SSH public key.
 
-- An explicit capacity/throttle rejection clears the pending checkpoint before
-  moving to another domain or size.
+- A fresh capacity/throttle rejection clears the pending checkpoint before
+  moving to another domain or size. After an uncertain response, throttling or
+  a permanent error during replay preserves the original checkpoint; only a
+  definite capacity rejection resolves it without an instance.
 - A timeout or unknown server error retains the exact request and token. The
   next run checks existing instances and then retries that same request.
 - A changed configuration, malformed checkpoint, or pending token older than
