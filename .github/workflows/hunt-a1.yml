@@ -1,62 +1,60 @@
 name: hunt-a1
+
 on:
-  schedule: [ { cron: '5 * * * *' } ]
-  workflow_dispatch: {}
-permissions: { contents: read, issues: write }
-concurrency: { group: hunt-a1, cancel-in-progress: false }
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Read-only preflight or bounded VM search'
+        type: choice
+        options: [preflight, hunt]
+        default: preflight
+      duration_seconds:
+        description: 'Total run budget, including preflight (120–720 seconds)'
+        type: choice
+        options: ['180', '360', '720']
+        default: '180'
+      allow_smaller:
+        description: 'Accept one 1 OCPU / 6 GB VM if the preferred 2/12 cannot launch'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+# Also serialize branch tests with the existing main workflow.
+concurrency:
+  group: hunt-a1
+  cancel-in-progress: false
+
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 58
+    timeout-minutes: 16
     steps:
-      - name: Install OCI CLI
-        run: pip install --quiet oci-cli
-      - name: Hunt A1 (2 OCPU / 12 GB)
-        id: launch
-        shell: bash --noprofile --norc {0}
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install pinned Oracle SDK
+        run: python -m pip install -r requirements.txt
+      - name: Preflight and bounded search
         env:
-          U: ${{ secrets.OCI_CLI_USER }}
-          T: ${{ secrets.OCI_CLI_TENANCY }}
-          F: ${{ secrets.OCI_CLI_FINGERPRINT }}
-          K: ${{ secrets.OCI_CLI_KEY_CONTENT }}
-          R: ${{ secrets.OCI_CLI_REGION }}
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          HUNTER_MODE: ${{ inputs.mode || 'hunt' }}
+          HUNTER_DURATION: ${{ inputs.duration_seconds || '720' }}
+          HUNTER_SMALLER: ${{ inputs.allow_smaller || (github.event_name == 'schedule' && vars.HUNTER_ALLOW_SMALLER == 'true') }}
+        shell: bash
         run: |
-          set -uo pipefail
-          mkdir -p ~/.oci
-          printf '%s\n' "$K" > ~/.oci/key.pem; chmod 600 ~/.oci/key.pem
-          { echo "[DEFAULT]"; echo "user=$U"; echo "tenancy=$T"; echo "fingerprint=$F"; echo "region=$R"; echo "key_file=$HOME/.oci/key.pem"; } > ~/.oci/config
-          chmod 600 ~/.oci/config
-          oci iam region list >/dev/null 2>&1 || { echo "❌ auth failed"; exit 1; }
-          C="$T"
-          COUNT=$(oci compute instance list -c "$C" --all 2>/dev/null | jq -r '[.data[]?|select(."display-name"=="tott-web" and ."lifecycle-state"=="RUNNING")]|length' 2>/dev/null || echo 0)
-          case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
-          if [ "$COUNT" -gt 0 ]; then echo "tott-web already RUNNING — done."; exit 0; fi
-          VCN=$(oci network vcn list -c "$C" --all | jq -r '.data[]?|select(."display-name"=="tott-vcn")|.id' | head -1)
-          SUBNET=$(oci network subnet list -c "$C" --vcn-id "$VCN" --all | jq -r '.data[]?|select(."prohibit-public-ip-on-vnic"==false)|.id' | head -1)
-          IMAGE=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" --operating-system-version 22.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC | jq -r '.data[0].id')
-          if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "config error: SUBNET/IMAGE empty"; exit 1; fi
-          META=$(jq -n --arg k "$SSH_PUBLIC_KEY" '{ssh_authorized_keys:$k}')
-          mapfile -t ADS < <(oci iam availability-domain list | jq -r '.data[].name')
-          END=$(( $(date +%s) + 3300 ))
-          while [ "$(date +%s)" -lt "$END" ]; do
-            for AD in $(printf '%s\n' "${ADS[@]}" | shuf); do
-              if oci compute instance launch --availability-domain "$AD" --compartment-id "$C" \
-                  --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-                  --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
-                  --display-name tott-web --metadata "$META" 2>/tmp/err; then
-                echo "✅ LAUNCHED in $AD"; echo "launched=true" >> "$GITHUB_OUTPUT"; echo "ad=$AD" >> "$GITHUB_OUTPUT"; exit 0
-              fi
-              if grep -qiE 'capacity' /tmp/err; then
-                echo "$(date +%T) out of capacity in $AD"
-              else
-                echo "$(date +%T) transient/other error in $AD (will keep trying): $(grep -oiE '"message": *"[^"]*"' /tmp/err | head -1)"
-              fi
-              sleep 15
-            done
-          done
-          echo "no capacity this run; next run starts next hour"
-      - name: Issue on success
-        if: steps.launch.outputs.launched == 'true'
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh issue create --title "✅ tott-web A1 launched (${{ steps.launch.outputs.ad }})" --body "Grab the public IP in OCI Compute > Instances, then disable this workflow." || true
+          args=(--mode "$HUNTER_MODE" --duration-seconds "$HUNTER_DURATION")
+          if [[ "$HUNTER_SMALLER" == "true" ]]; then args+=(--allow-smaller); fi
+          python -m hunter "${args[@]}"
