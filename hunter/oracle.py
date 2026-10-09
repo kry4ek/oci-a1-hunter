@@ -94,7 +94,15 @@ class OracleGateway:
             response = self._call(
                 operation, *args, **kwargs, **({"page": page} if page else {})
             )
-            items.extend(response.data)
+            # Older APIs return arrays; Container Instances returns a collection model.
+            batch = response.data
+            if not isinstance(batch, list):
+                batch = getattr(batch, "items", None)
+            if not isinstance(batch, list):
+                raise AttentionRequired(
+                    "OCI returned an unrecognized inventory response; stopping safely."
+                )
+            items.extend(batch)
             page = response.headers.get("opc-next-page")
             if not page:
                 return items

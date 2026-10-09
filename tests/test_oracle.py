@@ -242,6 +242,20 @@ class OracleTests(unittest.TestCase):
         )
         self.assertEqual(gateway._call.call_args.kwargs["page"], "next")
 
+    def test_actual_container_collection_response_is_supported(self):
+        gateway = self.gateway()
+        collection = oci.container_instances.models.ContainerInstanceCollection(
+            items=[]
+        )
+        gateway._call.return_value = NS(data=collection, headers={})
+        self.assertEqual(OracleGateway._list(gateway, "containers", "root"), [])
+
+    def test_missing_inventory_data_is_not_assumed_empty(self):
+        gateway = self.gateway()
+        gateway._call.return_value = NS(data=None, headers={})
+        with self.assertRaises(AttentionRequired):
+            OracleGateway._list(gateway, "containers", "root")
+
 
 if __name__ == "__main__":
     unittest.main()
