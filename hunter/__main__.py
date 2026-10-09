@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+import traceback
 
 from .core import (
     AttentionRequired,
@@ -97,6 +98,8 @@ def main(argv=None):
             log(
                 f"Preflight/runtime failure ({type(exc).__name__}); no further creation requests."
             )
+            for frame in traceback.extract_tb(exc.__traceback__)[-4:]:
+                log(f"Location: {os.path.basename(frame.filename)}:{frame.lineno} in {frame.name}")
         result.details = "Inspect the sanitized error above before resuming."
         exit_code = 1
     finally:
